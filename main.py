@@ -1,231 +1,86 @@
-import json
 import pandas as pd
-import numpy as np
+from autogluon.tabular import TabularDataset, TabularPredictor
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from collections import Counter
-import time
 
 # ==========================================
-# 1. 配置与环境设置
+# 1. 配置
 # ==========================================
+# 你的 5070Ti 显存充足，presets='best_quality' 会做多层 stacking，效果最好但训练较慢
+# 如果想快点看到结果，可以改用 presets='high_quality' 或 'medium_quality'
 CONFIG = {
-    'min_freq': 2,          # 过滤掉出现次数少于2次的稀有食材，减少噪音
-    'batch_size': 128,      # 批次大小
-    'lr': 0.001,            # 学习率
-    'epochs': 15,           # 训练轮数
-    'hidden_dim': 512,      # 隐藏层维度
-    'dropout': 0.5,         # Dropout比例
-    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+    'presets': 'best_quality', 
+    'time_limit': 600,  # 训练时间限制 (秒)，设为 None 则不限制，跑完为止
+    'eval_metric': 'accuracy'
 }
 
-print(f"Running on device: {CONFIG['device']}")
-if CONFIG['device'] == 'cuda':
-    print(f"GPU Name: {torch.cuda.get_device_name(0)}")
+# 检查 GPU
+num_gpus = 1 if torch.cuda.is_available() else 0
+print(f"GPUs available: {num_gpus}")
 
 # ==========================================
-# 2. 数据预处理工具类
+# 2. 数据处理
 # ==========================================
-class IngredientTokenizer:
-    """
-    负责将食材列表转换为 Multi-Hot 向量 (0/1 向量)
-    """
-    def __init__(self, min_freq=1):
-        self.min_freq = min_freq
-        self.vocab = {}
-        self.idx2word = {}
-        
-    def fit(self, ingredients_list):
-        # 统计词频
-        counter = Counter()
-        for ingredients in ingredients_list:
-            counter.update(ingredients)
-        
-        # 构建词表 (过滤低频词)
-        valid_ingredients = [word for word, count in counter.items() if count >= self.min_freq]
-        self.vocab = {word: idx for idx, word in enumerate(valid_ingredients)}
-        self.idx2word = {idx: word for word, idx in self.vocab.items()}
-        print(f"Vocabulary size: {len(self.vocab)} (Original unique ingredients: {len(counter)})")
-        
-    def transform(self, ingredients_list):
-        # 转换为 Multi-Hot 向量
-        dim = len(self.vocab)
-        vectors = np.zeros((len(ingredients_list), dim), dtype=np.float32)
-        
-        for i, ingredients in enumerate(ingredients_list):
-            for ing in ingredients:
-                if ing in self.vocab:
-                    vectors[i, self.vocab[ing]] = 1.0
-        return vectors
+def load_and_process(file_path, is_train=True):
+    # 读取 JSON
+    df = pd.read_json(file_path)
+    
+    # 核心步骤：将 list ['salt', 'pepper'] 转换为 string "salt pepper"
+    # 这样 AutoGluon 就能把它当作 NLP 文本特征自动处理
+    df['ingredients_text'] = df['ingredients'].apply(lambda x: ' '.join(x))
+    
+    # 只要文本特征和标签，去掉原始 list 列
+    if is_train:
+        return df[['ingredients_text', 'cuisine']]
+    else:
+        # 测试集保留 id 用于提交
+        return df[['id', 'ingredients_text']]
 
-    def __len__(self):
-        return len(self.vocab)
+print("Loading data...")
+train_data = load_and_process('train.json', is_train=True)
+test_data = load_and_process('test.json', is_train=False)
+
+print(f"Train shape: {train_data.shape}")
+print(train_data.head())
 
 # ==========================================
-# 3. PyTorch Dataset 定义
+# 3. AutoGluon 训练
 # ==========================================
-class CuisineDataset(Dataset):
-    def __init__(self, X, y=None):
-        self.X = torch.FloatTensor(X)
-        self.y = torch.LongTensor(y) if y is not None else None
-        
-    def __len__(self):
-        return len(self.X)
-    
-    def __getitem__(self, idx):
-        if self.y is not None:
-            return self.X[idx], self.y[idx]
-        else:
-            return self.X[idx]
+print("Starting AutoGluon training...")
 
-# ==========================================
-# 4. 模型定义 (MLP)
-# ==========================================
-class CuisineClassifier(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim=256, dropout=0.5):
-        super(CuisineClassifier, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim), # BN层加速收敛
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.BatchNorm1d(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_dim // 2, output_dim)
-        )
-        
-    def forward(self, x):
-        return self.net(x)
+# 转换为 TabularDataset 对象
+train_data = TabularDataset(train_data)
+
+predictor = TabularPredictor(
+    label='cuisine', 
+    eval_metric=CONFIG['eval_metric'],
+    path='ag_models_cuisine'  # 模型保存路径
+).fit(
+    train_data,
+    presets=CONFIG['presets'],
+    time_limit=CONFIG['time_limit'],
+    ag_args_fit={'num_gpus': num_gpus}  # 显式开启 GPU
+)
 
 # ==========================================
-# 5. 主程序逻辑
+# 4. 评估与预测
 # ==========================================
-def load_data():
-    print("Loading data...")
-    with open('train.json', 'r', encoding='utf-8') as f:
-        train_data = json.load(f)
-    with open('test.json', 'r', encoding='utf-8') as f:
-        test_data = json.load(f)
-    
-    # 提取数据
-    train_df = pd.DataFrame(train_data)
-    test_df = pd.DataFrame(test_data)
-    
-    return train_df, test_df
+# 查看训练集上的各个模型表现
+leaderboard = predictor.leaderboard(train_data, silent=True)
+print("\nModel Leaderboard (on training data subset):")
+print(leaderboard[['model', 'score_val']].head())
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, device):
-    best_acc = 0.0
-    
-    for epoch in range(CONFIG['epochs']):
-        # --- Training ---
-        model.train()
-        train_loss = 0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-            
-        # --- Validation ---
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                outputs = model(X_batch)
-                _, predicted = torch.max(outputs.data, 1)
-                total += y_batch.size(0)
-                correct += (predicted == y_batch).sum().item()
-        
-        val_acc = 100 * correct / total
-        print(f"Epoch [{epoch+1}/{CONFIG['epochs']}], Loss: {train_loss/len(train_loader):.4f}, Val Acc: {val_acc:.2f}%")
-        
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), 'best_model.pth')
-            
-    print(f"Training finished. Best Validation Accuracy: {best_acc:.2f}%")
+print("\nPredicting on Test set...")
+# 预测
+test_features = TabularDataset(test_data[['ingredients_text']])
+predictions = predictor.predict(test_features)
 
-def main():
-    # 1. 读取数据
-    train_df, test_df = load_data()
-    
-    # 2. 标签编码 (String -> Int)
-    label_encoder = LabelEncoder()
-    train_labels = label_encoder.fit_transform(train_df['cuisine'])
-    num_classes = len(label_encoder.classes_)
-    print(f"Number of classes: {num_classes}")
-    print(f"Classes: {label_encoder.classes_}")
+# ==========================================
+# 5. 生成提交文件
+# ==========================================
+submission = pd.DataFrame({
+    'id': test_data['id'],
+    'cuisine': predictions
+})
 
-    # 3. 特征工程 (Ingredients -> Multi-Hot Vectors)
-    tokenizer = IngredientTokenizer(min_freq=CONFIG['min_freq'])
-    tokenizer.fit(train_df['ingredients']) # 仅基于训练集构建词表
-    
-    X_all = tokenizer.transform(train_df['ingredients'])
-    X_test = tokenizer.transform(test_df['ingredients'])
-    
-    # 4. 划分训练集和验证集
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_all, train_labels, test_size=0.1, random_state=42, stratify=train_labels
-    )
-    
-    # 5. 构建 DataLoader
-    # 注意: Windows下 num_workers 建议设为 0，否则可能报错
-    train_dataset = CuisineDataset(X_train, y_train)
-    val_dataset = CuisineDataset(X_val, y_val)
-    test_dataset = CuisineDataset(X_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0)
-    
-    # 6. 初始化模型、损失函数、优化器
-    model = CuisineClassifier(input_dim=len(tokenizer), output_dim=num_classes, hidden_dim=CONFIG['hidden_dim'], dropout=CONFIG['dropout'])
-    model = model.to(CONFIG['device'])
-    
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=CONFIG['lr'], weight_decay=1e-5) # weight_decay用于L2正则化
-    
-    # 7. 训练
-    train_model(model, train_loader, val_loader, criterion, optimizer, CONFIG['device'])
-    
-    # 8. 预测 Test 集
-    print("Generating predictions on test set...")
-    # 加载最佳模型参数
-    model.load_state_dict(torch.load('best_model.pth'))
-    model.eval()
-    
-    predictions = []
-    with torch.no_grad():
-        for X_batch in test_loader:
-            X_batch = X_batch.to(CONFIG['device'])
-            outputs = model(X_batch)
-            _, predicted = torch.max(outputs.data, 1)
-            predictions.extend(predicted.cpu().numpy())
-            
-    # 9. 将数字标签转换回字符串
-    predicted_cuisines = label_encoder.inverse_transform(predictions)
-    
-    # 10. 保存结果
-    submission = pd.DataFrame({
-        'id': test_df['id'],
-        'cuisine': predicted_cuisines
-    })
-    submission.to_csv('submission.csv', index=False)
-    print("Done! Result saved to submission.csv")
-
-if __name__ == '__main__':
-    main()
+submission.to_csv('submission_autogluon.csv', index=False)
+print("Done! Saved to submission_autogluon.csv")
