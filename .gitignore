@@ -1,3 +1,5 @@
 sample_submission_cuisine.csv
 test.json
 train.json
+.vscode
+*.pth
