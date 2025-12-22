@@ -4,97 +4,142 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.svm import LinearSVC
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import LabelEncoder
-from transformers import BertTokenizer, BertForSequenceClassification, get_linear_schedule_with_warmup
+from sklearn.model_selection import StratifiedKFold
+from transformers import RobertaTokenizer, RobertaForSequenceClassification, get_linear_schedule_with_warmup
 from torch.optim import AdamW
 import re
 from tqdm import tqdm
-import os
+import nltk
+from nltk.stem import WordNetLemmatizer
 
 # ==========================================
-# 1. 配置
+# 0. 环境与配置
 # ==========================================
+# 第一次运行需要下载 nltk 数据
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    nltk.download('wordnet')
+    nltk.download('omw-1.4')
+
 CONFIG = {
-    'model_name': 'bert-base-uncased', # 或者 'distilbert-base-uncased' (速度更快)
-    'max_len': 128,          # 食材文本的最大长度
-    'batch_size': 32,        # 显存够大(5070Ti)可以设为 32 或 64
-    'epochs': 10,             # BERT 微调通常 3-5 轮即可
-    'lr': 3e-5,              # BERT 常用学习率
+    'seed': 42,
+    'roberta_model': 'roberta-base',
+    'max_len': 128,
+    'batch_size': 32,      # 5070Ti 显存充足，可设为 32 或 64
+    'epochs': 12,           # RoBERTa 训练轮数
+    'lr': 2e-5,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'seed': 42
+    'ensemble_weight': 0.5 # 0.5 表示 SVC 和 RoBERTa 各占 50% 权重
 }
 
 def set_seed(seed):
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
 
 set_seed(CONFIG['seed'])
-print(f"Using device: {CONFIG['device']}")
+print(f"Running on: {CONFIG['device']}")
 
 # ==========================================
-# 2. 数据清洗 (关键步骤)
+# 1. 强力数据清洗
 # ==========================================
-def clean_ingredient(text):
-    # 转小写
+lemmatizer = WordNetLemmatizer()
+
+def clean_text(text):
+    # 1. 转小写
     text = text.lower()
-    
-    # 去除特殊符号
-    text = re.sub(r'[^a-z\s]', ' ', text)
-    
-    # 常见的无用修饰词 (可以根据数据分析继续扩充)
-    stop_words = [
+    # 2. 去除非字母字符 (保留空格和连字符)
+    text = re.sub(r'[^a-z\s-]', '', text)
+    # 3. 去除无意义的单位和修饰词
+    stop_words = set([
         'fresh', 'ground', 'chopped', 'sliced', 'diced', 'crushed', 'minced', 'grated', 
         'large', 'medium', 'small', 'cloves', 'lb', 'oz', 'drained', 'pitted', 'beaten', 
-        'unsalted', 'all-purpose', 'chunks', 'dried', 'leaves', 'powder', 'frozen', 'warm'
-    ]
-    
-    # 移除这些词
-    for word in stop_words:
-        text = re.sub(r'\b' + word + r'\b', '', text)
+        'unsalted', 'all-purpose', 'chunks', 'dried', 'leaves', 'powder', 'frozen', 'warm',
+        'melted', 'boneless', 'skinless', 'halves'
+    ])
+    words = [w for w in text.split() if w not in stop_words]
+    # 4. 词形还原 (olives -> olive)
+    words = [lemmatizer.lemmatize(w) for w in words]
+    return ' '.join(words)
+
+def load_data():
+    print("Loading data...")
+    with open('train.json', 'r', encoding='utf-8') as f:
+        train_data = json.load(f)
+    with open('test.json', 'r', encoding='utf-8') as f:
+        test_data = json.load(f)
         
-    # 去除多余空格
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
-
-def preprocess_data(file_path, is_train=True):
-    with open(file_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    train_df = pd.DataFrame(train_data)
+    test_df = pd.DataFrame(test_data)
     
-    df = pd.DataFrame(data)
+    # 清洗 ingredients
+    print("Cleaning ingredients...")
+    # 保存原始列表用于 Deep Learning 的 Shuffle
+    train_df['clean_list'] = train_df['ingredients'].apply(lambda x: [clean_text(i) for i in x])
+    test_df['clean_list'] = test_df['ingredients'].apply(lambda x: [clean_text(i) for i in x])
     
-    # 将 list 里的食材清洗后，用逗号连接成字符串
-    # 例如: ["fresh garlic", "soy sauce"] -> "garlic, soy sauce"
-    # BERT 能够理解这种序列
-    df['text'] = df['ingredients'].apply(
-        lambda x: ', '.join([clean_ingredient(ing) for ing in x])
-    )
+    # 生成用于 TF-IDF 的字符串
+    train_df['text_str'] = train_df['clean_list'].apply(lambda x: ' '.join(x))
+    test_df['text_str'] = test_df['clean_list'].apply(lambda x: ' '.join(x))
     
-    return df
+    return train_df, test_df
 
 # ==========================================
-# 3. Dataset 定义
+# 2. 模型 A: TF-IDF + LinearSVC (传统强项)
 # ==========================================
-class CuisineBertDataset(Dataset):
-    def __init__(self, texts, labels, tokenizer, max_len):
-        self.texts = texts
+def train_svc(train_df, test_df, y_train_enc):
+    print("\n[Model A] Training LinearSVC...")
+    
+    # TF-IDF 特征提取 (包含 1-gram 和 2-gram)
+    tfidf = TfidfVectorizer(binary=True, ngram_range=(1, 2), min_df=3, max_df=0.9)
+    X_train_tfidf = tfidf.fit_transform(train_df['text_str'])
+    X_test_tfidf = tfidf.transform(test_df['text_str'])
+    
+    # LinearSVC 本身不支持 predict_proba，需配合 CalibratedClassifierCV
+    svc = LinearSVC(C=0.8, penalty='l2', dual=False, max_iter=3000, random_state=CONFIG['seed'])
+    clf = CalibratedClassifierCV(svc, method='sigmoid', cv=5)
+    
+    clf.fit(X_train_tfidf, y_train_enc)
+    
+    # 获取概率预测
+    probs = clf.predict_proba(X_test_tfidf)
+    print("SVC training done.")
+    return probs
+
+# ==========================================
+# 3. 模型 B: RoBERTa + Shuffle Augmentation
+# ==========================================
+class CuisineRobertaDataset(Dataset):
+    def __init__(self, ingredients_lists, labels, tokenizer, max_len, is_train=False):
+        self.ingredients_lists = ingredients_lists
         self.labels = labels
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.is_train = is_train # 如果是训练模式，开启 Shuffle
         
     def __len__(self):
-        return len(self.texts)
+        return len(self.ingredients_lists)
     
     def __getitem__(self, idx):
-        text = str(self.texts[idx])
+        ingredients = self.ingredients_lists[idx]
+        
+        # --- 关键策略: 训练时随机打乱食材顺序 ---
+        if self.is_train:
+            ingredients = list(ingredients) # 复制副本
+            np.random.shuffle(ingredients)
+            
+        text = ", ".join(ingredients) # 使用逗号分隔对 RoBERTa 更友好
         
         encoding = self.tokenizer.encode_plus(
             text,
             add_special_tokens=True,
             max_length=self.max_len,
             padding='max_length',
-            return_token_type_ids=False,
             truncation=True,
             return_attention_mask=True,
             return_tensors='pt',
@@ -110,181 +155,117 @@ class CuisineBertDataset(Dataset):
             
         return item
 
-# ==========================================
-# 4. 训练函数
-# ==========================================
-def train_epoch(model, data_loader, optimizer, scheduler, device, loss_fn):
-    model.train()
-    total_loss = 0
-    correct_predictions = 0
-    n_examples = 0
+def train_roberta(train_df, test_df, y_train_enc, num_classes):
+    print("\n[Model B] Training RoBERTa with Shuffle Augmentation...")
     
-    progress_bar = tqdm(data_loader, desc="Training")
+    tokenizer = RobertaTokenizer.from_pretrained(CONFIG['roberta_model'])
     
-    for d in progress_bar:
-        input_ids = d["input_ids"].to(device)
-        attention_mask = d["attention_mask"].to(device)
-        targets = d["labels"].to(device)
-        
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        
-        # HuggingFace 的分类模型输出是 logits
-        loss = loss_fn(outputs.logits, targets)
-        
-        _, preds = torch.max(outputs.logits, dim=1)
-        correct_predictions += torch.sum(preds == targets)
-        n_examples += targets.size(0)
-        
-        total_loss += loss.item()
-        loss.backward()
-        
-        # 梯度裁剪，防止梯度爆炸
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad()
-        
-        progress_bar.set_postfix({'loss': loss.item()})
-        
-    return correct_predictions.double() / n_examples, total_loss / len(data_loader)
-
-def eval_model(model, data_loader, device, loss_fn):
-    model.eval()
-    correct_predictions = 0
-    n_examples = 0
-    total_loss = 0
-    
-    with torch.no_grad():
-        for d in data_loader:
-            input_ids = d["input_ids"].to(device)
-            attention_mask = d["attention_mask"].to(device)
-            targets = d["labels"].to(device)
-            
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask
-            )
-            
-            loss = loss_fn(outputs.logits, targets)
-            total_loss += loss.item()
-            
-            _, preds = torch.max(outputs.logits, dim=1)
-            correct_predictions += torch.sum(preds == targets)
-            n_examples += targets.size(0)
-            
-    return correct_predictions.double() / n_examples, total_loss / len(data_loader)
-
-# ==========================================
-# 5. 主程序
-# ==========================================
-def main():
-    # --- 1. 数据加载与处理 ---
-    print("Loading and preprocessing data...")
-    train_df = preprocess_data('train.json', is_train=True)
-    test_df = preprocess_data('test.json', is_train=False)
-    
-    # 标签编码
-    label_encoder = LabelEncoder()
-    train_df['label_id'] = label_encoder.fit_transform(train_df['cuisine'])
-    num_classes = len(label_encoder.classes_)
-    
-    # 划分验证集
-    X_train, X_val, y_train, y_val = train_test_split(
-        train_df['text'].values, 
-        train_df['label_id'].values, 
-        test_size=0.1, 
-        random_state=CONFIG['seed'],
-        stratify=train_df['label_id'].values
+    # 全量数据训练 (不再划分验证集，为了最大化利用数据冲榜)
+    # 如果你想看验证集分数，可以自己 split，但提交时建议用全量
+    train_dataset = CuisineRobertaDataset(
+        train_df['clean_list'].values, 
+        y_train_enc, 
+        tokenizer, 
+        CONFIG['max_len'], 
+        is_train=True # 开启打乱
     )
     
-    print(f"Train size: {len(X_train)}, Val size: {len(X_val)}")
-    
-    # --- 2. Tokenizer & DataLoader ---
-    print(f"Loading BERT tokenizer ({CONFIG['model_name']})...")
-    tokenizer = BertTokenizer.from_pretrained(CONFIG['model_name'])
-    
-    train_dataset = CuisineBertDataset(X_train, y_train, tokenizer, CONFIG['max_len'])
-    val_dataset = CuisineBertDataset(X_val, y_val, tokenizer, CONFIG['max_len'])
-    test_dataset = CuisineBertDataset(test_df['text'].values, None, tokenizer, CONFIG['max_len'])
+    test_dataset = CuisineRobertaDataset(
+        test_df['clean_list'].values, 
+        None, 
+        tokenizer, 
+        CONFIG['max_len'], 
+        is_train=False
+    )
     
     train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0)
     test_loader = DataLoader(test_dataset, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=0)
     
-    # --- 3. 模型初始化 ---
-    print("Initializing BERT model...")
-    model = BertForSequenceClassification.from_pretrained(
-        CONFIG['model_name'],
-        num_labels=num_classes,
-        output_attentions=False,
-        output_hidden_states=False
+    model = RobertaForSequenceClassification.from_pretrained(
+        CONFIG['roberta_model'],
+        num_labels=num_classes
     )
-    model = model.to(CONFIG['device'])
+    model.to(CONFIG['device'])
     
-    # 优化器设置：使用 AdamW，并带有 Warmup
     optimizer = AdamW(model.parameters(), lr=CONFIG['lr'])
-    total_steps = len(train_loader) * CONFIG['epochs']
     scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(total_steps * 0.1), # 10% warmup
-        num_training_steps=total_steps
+        optimizer, num_warmup_steps=0, num_training_steps=len(train_loader) * CONFIG['epochs']
     )
     
-    # 损失函数 (Label Smoothing 有助于防止过拟合)
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1).to(CONFIG['device'])
-    
-    # --- 4. 训练循环 ---
-    best_acc = 0
+    loss_fn = nn.CrossEntropyLoss(label_smoothing=0.1) # 标签平滑
     
     for epoch in range(CONFIG['epochs']):
-        print(f"\nEpoch {epoch + 1}/{CONFIG['epochs']}")
+        model.train()
+        total_loss = 0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CONFIG['epochs']}")
         
-        train_acc, train_loss = train_epoch(
-            model, train_loader, optimizer, scheduler, CONFIG['device'], loss_fn
-        )
-        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-        
-        val_acc, val_loss = eval_model(
-            model, val_loader, CONFIG['device'], loss_fn
-        )
-        print(f"Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc:.4f}")
-        
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), 'best_bert_model.pth')
-            print("=> Model saved!")
+        for batch in pbar:
+            input_ids = batch['input_ids'].to(CONFIG['device'])
+            attention_mask = batch['attention_mask'].to(CONFIG['device'])
+            labels = batch['labels'].to(CONFIG['device'])
             
-    print(f"\nBest Validation Accuracy: {best_acc:.4f}")
+            optimizer.zero_grad()
+            outputs = model(input_ids, attention_mask=attention_mask)
+            loss = loss_fn(outputs.logits, labels)
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            
+            total_loss += loss.item()
+            pbar.set_postfix({'loss': loss.item()})
+            
+    print("RoBERTa training finished. Generating predictions...")
     
-    # --- 5. 预测与提交 ---
-    print("Generating predictions on Test set...")
-    model.load_state_dict(torch.load('best_bert_model.pth'))
     model.eval()
-    
-    predictions = []
+    all_probs = []
     with torch.no_grad():
-        for d in tqdm(test_loader, desc="Predicting"):
-            input_ids = d["input_ids"].to(CONFIG['device'])
-            attention_mask = d["attention_mask"].to(CONFIG['device'])
+        for batch in tqdm(test_loader, desc="Predicting"):
+            input_ids = batch['input_ids'].to(CONFIG['device'])
+            attention_mask = batch['attention_mask'].to(CONFIG['device'])
             
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            _, preds = torch.max(outputs.logits, dim=1)
-            predictions.extend(preds.cpu().numpy())
+            outputs = model(input_ids, attention_mask=attention_mask)
+            # 使用 Softmax 获取概率
+            probs = torch.softmax(outputs.logits, dim=1)
+            all_probs.append(probs.cpu().numpy())
             
-    # 转换回文本标签
-    predicted_labels = label_encoder.inverse_transform(predictions)
+    return np.concatenate(all_probs, axis=0)
+
+# ==========================================
+# 4. 主流程：集成 (Ensemble)
+# ==========================================
+def main():
+    train_df, test_df = load_data()
     
+    # 标签编码
+    le = LabelEncoder()
+    y_train_enc = le.fit_transform(train_df['cuisine'])
+    num_classes = len(le.classes_)
+    print(f"Num classes: {num_classes}")
+    
+    # 1. 获取 SVC 的概率预测
+    svc_probs = train_svc(train_df, test_df, y_train_enc)
+    
+    # 2. 获取 RoBERTa 的概率预测
+    roberta_probs = train_roberta(train_df, test_df, y_train_enc, num_classes)
+    
+    # 3. 加权融合 (Soft Voting)
+    print("\nBlending models...")
+    # 可以根据验证集结果调整权重，通常 SVC 在此任务很强，5:5 开或者 SVC 占 0.4 都可以
+    final_probs = (svc_probs * 0.5) + (roberta_probs * 0.5)
+    
+    # 4. 取最大概率对应的标签
+    final_preds = np.argmax(final_probs, axis=1)
+    final_labels = le.inverse_transform(final_preds)
+    
+    # 5. 保存
     submission = pd.DataFrame({
         'id': test_df['id'],
-        'cuisine': predicted_labels
+        'cuisine': final_labels
     })
-    
-    submission.to_csv('submission_bert.csv', index=False)
-    print("Done! Saved to submission_bert.csv")
+    submission.to_csv('submission_ensemble.csv', index=False)
+    print("Done! Result saved to submission_ensemble.csv")
 
 if __name__ == '__main__':
     main()
